@@ -1,0 +1,734 @@
+# Luna
+
+A minimal build system combining Ninja's speed with Lua's flexibility.
+
+## Overview
+
+Luna is a language-agnostic build system focused on dependency resolution and parallel execution. It combines:
+
+- **Ninja's** DAG execution engine and rebuild detection
+- **Lua's** scripting for dynamic recipe generation
+
+The result is a single statically-linked binary.
+
+## Core Concepts
+
+### Recipes
+
+A recipe defines three things: **inputs**, **outputs**, and **build instructions**. Recipes are added to a global list using `recipes:add`.
+
+```lua
+CC = "gcc"
+CFLAGS = "-O2"
+
+recipes:add {
+    inputs = "app.c",
+    outputs = "app.o",
+    run = CC .. " " .. CFLAGS .. " -c app.c -o app.o"
+}
+```
+
+A `.luna` file is just Lua. Use normal Lua string operations - no special substitution syntax.
+
+`inputs` and `outputs` can be a single value or a list:
+
+```lua
+-- Single input/output
+inputs = "app.c",
+outputs = "app.o",
+
+-- Multiple inputs/outputs
+inputs = { "main.c", "util.c" },
+outputs = { "app", "app.map" },
+```
+
+Build instructions (`run`) can be:
+- A **string**: single shell command
+- A **list of strings**: multiple shell commands
+- An **instruction block**: Lua code between `@@` delimiters
+
+```lua
+-- Single command
+run = CC .. " -c app.c -o app.o"
+
+-- Multiple commands
+run = {
+    CC .. " -c app.c -o app.o",
+    "echo done"
+}
+
+-- Instruction block (for complex logic - see below)
+run =
+@@
+run(CC, CFLAGS, "-c", inputs[1], "-o", outputs[1])
+@@
+```
+
+### Instruction Blocks
+
+For simple commands, use string concatenation. For complex logic (like parsing depfiles), use instruction blocks.
+
+Instruction blocks run in an **isolated environment** - only variables declared in `uses` are visible. This isolation enables static DAG analysis without executing the block.
+
+```lua
+CC = "gcc"
+CFLAGS = "-O2"
+
+recipes:add {
+    inputs = "app.c",
+    outputs = "app.o",
+    uses = { CC, CFLAGS },
+    run =
+    @@
+    run(CC, CFLAGS, "-c", inputs[1], "-o", outputs[1])
+    @@
+}
+```
+
+Inside a block:
+- `inputs` / `outputs` - tables of resolved file paths
+- Variables from `uses` - imported from global scope or explicitly set
+- Built-in functions (`run`, `sh`, `parse_depfile`, etc.)
+
+`uses` supports importing or assigning:
+
+```lua
+uses = { CC, CFLAGS },           -- import from global scope
+uses = { CC = "clang" },         -- explicit value
+uses = { CC, OPT = "-O3" },      -- mixed
+```
+
+Named blocks can be reused:
+
+```lua
+compile_c =
+@@
+run(CC, CFLAGS, "-c", inputs[1], "-o", outputs[1])
+@@
+
+recipes:add {
+    inputs = "app.c",
+    outputs = "app.o",
+    uses = { CC, CFLAGS },
+    run = compile_c
+}
+
+recipes:add {
+    inputs = "util.c",
+    outputs = "util.o",
+    uses = { CC, CFLAGS },
+    run = compile_c
+}
+```
+
+### Input Types
+
+Inputs can be files, patterns, or other recipes:
+
+```lua
+generator = recipes:add { ... }
+
+recipes:add {
+    inputs = {
+        "main.c",                    -- explicit file
+        glob("include/**/*.h"),      -- pattern (scanned at DAG resolution)
+        generator                    -- recipe reference (its outputs become inputs)
+    },
+    outputs = "app",
+    ...
+}
+```
+
+**Pattern inputs** are essential for directory-based dependencies like C/C++ headers. Luna scans directories during DAG resolution to expand patterns into concrete file lists.
+
+### Recipe as Input
+
+When recipe A lists recipe B as an input, B must complete first and B's outputs become A's inputs (as file paths).
+
+`recipes:add` returns a reference that can be stored and used as an input:
+
+```lua
+generator = recipes:add {
+    inputs = "schema.json",
+    outputs = { "generated.c", "generated.h" },
+    run = "codegen schema.json"
+}
+
+recipes:add {
+    alias = "app",
+    inputs = { "main.c", generator },
+    outputs = "app",
+    uses = { CC },
+    run =
+    @@
+    -- inputs = {"main.c", "generated.c", "generated.h"}
+    run(CC, "-o", outputs[1], table.unpack(inputs))
+    @@
+}
+```
+
+### Recipes as Outputs
+
+A recipe can output another recipe. Recipe files (`.luna`) are just another output type. Luna recursively loads them.
+
+This enables single-pass compilation with correct dependency tracking:
+
+```lua
+CC = "gcc"
+CFLAGS = "-O2 -MMD"
+
+-- This recipe compiles AND generates a dependency recipe
+recipes:add {
+    alias = "app_compile",
+    inputs = "app.c",
+    outputs = { "app.o", ".luna/app_o.luna" },
+    uses = { CC, CFLAGS },
+    run =
+    @@
+    -- Compile with depfile generation
+    run(CC, CFLAGS, "-c", inputs[1], "-o", "app.o")
+
+    -- Parse depfile, generate a recipe for future builds
+    local headers = parse_depfile("app.d")
+
+    write_recipe(".luna/app_o.luna", {
+        alias = "app_o_deps",
+        inputs = headers,
+        outputs = "app.o",
+        run = CC .. " " .. CFLAGS .. " -c app.c -o app.o"
+    })
+    @@
+}
+```
+
+`write_recipe` generates a valid `.luna` file:
+
+**Generated:** `.luna/app_o.luna`
+```lua
+-- Auto-generated by Luna
+recipes:add {
+    alias = "app_o_deps",
+    inputs = { "app.c", "bar.h", "stdio.h" },
+    outputs = "app.o",
+    run = "gcc -O2 -MMD -c app.c -o app.o"
+}
+```
+
+Note: The generated recipe uses literal values, making it self-contained.
+
+### Recipe Precedence
+
+When multiple recipes produce the same output, **the recipe with fewer outputs takes precedence**.
+
+In the example above:
+- `app_compile` has outputs `{app.o, .luna/app_o.luna}` → 2 outputs
+- `app_o_deps` has outputs `{app.o}` → 1 output
+
+Luna chooses `app_o_deps` because it's more specific.
+
+**Build flow:**
+
+1. **First build**: Only `app_compile` exists → it runs, creates both `app.o` and `.luna/app_o.luna`
+2. **Second build**: Both recipes exist. `app_o_deps` has fewer outputs → it takes precedence. `app.o` is fresh → no-op
+3. **Header changed**: `app_o_deps` runs (it depends on headers), recompiles, regenerates `.luna/app_o.luna`
+4. **Source deleted**: `.luna/app_o.luna` becomes stale, `app_compile` takes over again
+
+This precedence rule enables single-pass compilation while maintaining correct rebuilds.
+
+## Why Isolation Matters
+
+For simple string commands, variables are expanded at recipe definition time - no isolation needed:
+
+```lua
+recipes:add {
+    inputs = "app.c",
+    outputs = "app.o",
+    run = CC .. " " .. CFLAGS .. " -c app.c -o app.o"  -- expanded immediately
+}
+```
+
+But instruction blocks are different. Without isolation, you can't know a block's dependencies without executing code:
+
+```lua
+-- BAD: Hidden dependency on global state
+if DEBUG then
+    CFLAGS = "-g"
+end
+
+recipes:add {
+    inputs = "app.c",
+    outputs = "app.o",
+    run =
+    @@
+    run("gcc", CFLAGS, "-c", "app.c")  -- What is CFLAGS? Depends on DEBUG.
+    @@
+}
+```
+
+With isolation, dependencies are explicit:
+
+```lua
+-- GOOD: All dependencies declared in uses
+recipes:add {
+    inputs = "app.c",
+    outputs = "app.o",
+    uses = { CFLAGS },
+    run =
+    @@
+    run("gcc", CFLAGS, "-c", inputs[1], "-o", outputs[1])
+    @@
+}
+```
+
+Luna can extract the DAG by parsing, without executing the instruction blocks.
+
+## Syntax
+
+A `.luna` file is standard Lua with instruction blocks delimited by `@@`.
+
+### Recipe Structure
+
+```lua
+recipes:add {
+    alias = "target",                              -- optional CLI shorthand
+    inputs = "file",                               -- string or list
+    outputs = "target",                            -- string or list; omit for phony
+    uses = { VAR1, VAR2 },                         -- only needed for instruction blocks
+    run = "command"                                -- string, list, or instruction block
+}
+```
+
+### Aliases
+
+The `alias` field provides a CLI target name: you can build by output (`luna app.o`) or by alias (`luna app`).
+
+- For recipes with outputs: alias is optional (can use output filename)
+- For phony recipes (no outputs): alias is required
+
+### Instruction Blocks
+
+Instruction blocks are named by assignment:
+
+```lua
+-- Named block
+compile_c =
+@@
+run(CC, "-c", inputs[1], "-o", outputs[1])
+@@
+
+-- Use in recipe
+recipes:add {
+    inputs = "app.c",
+    outputs = "app.o",
+    uses = { CC },
+    run = compile_c
+}
+```
+
+`@@` must be at the start of a line (after optional whitespace for indentation).
+
+### Phony Targets
+
+Omit `outputs` to create a target that runs every time:
+
+```lua
+recipes:add {
+    alias = "clean",
+    run = "rm -rf build/ .luna/"
+}
+
+app = recipes:add {
+    alias = "app",
+    inputs = "main.c",
+    outputs = "app",
+    run = CC .. " -o app main.c"
+}
+
+test = recipes:add {
+    alias = "test",
+    inputs = app,  -- depends on app being built
+    run = "./app --test"
+}
+
+recipes:add {
+    alias = "all",
+    inputs = { app, test }  -- just triggers dependencies
+    -- no run = just ensures dependencies are built
+}
+```
+
+Run with `luna clean`, `luna test`, `luna all`.
+
+## Complete Example
+
+```lua
+-- build.luna
+
+CC = os.getenv("CC") or "gcc"
+CFLAGS = "-O2 -Wall -MMD"
+sources = glob("src/*.c")
+
+-- Reusable instruction block for compiling with dependency generation
+compile_with_deps =
+@@
+run(CC, CFLAGS, "-c", src, "-o", obj)
+
+local headers = parse_depfile(depfile)
+write_recipe(dep_recipe, {
+    alias = recipe_alias .. "_deps",
+    inputs = headers,
+    outputs = obj,
+    run = CC .. " " .. CFLAGS .. " -c " .. src .. " -o " .. obj
+})
+@@
+
+-- Create compile recipes for all sources
+objects = {}
+for _, src in ipairs(sources) do
+    local obj = src:gsub("%.c$", ".o")
+    local depfile = src:gsub("%.c$", ".d")
+    local dep_recipe = ".luna/" .. src:gsub("[/.]", "_") .. ".luna"
+    local recipe_alias = src:gsub("[/.]", "_")
+
+    recipes:add {
+        alias = recipe_alias,
+        inputs = src,
+        outputs = { obj, dep_recipe },
+        uses = {
+            CC, CFLAGS,
+            src = src, obj = obj,
+            depfile = depfile, dep_recipe = dep_recipe,
+            recipe_alias = recipe_alias
+        },
+        run = compile_with_deps
+    }
+
+    table.insert(objects, obj)
+end
+
+-- Link all objects
+recipes:add {
+    alias = "app",
+    inputs = objects,
+    outputs = "app",
+    uses = { CC },
+    run =
+    @@
+    run(CC, "-o", outputs[1], table.unpack(inputs))
+    @@
+}
+
+default("app")
+```
+
+## How Luna Resolves to Ninja
+
+Luna translates `.luna` files to Ninja's internal DAG format:
+
+1. **Parse** all `.luna` files (including generated ones from `.luna/`)
+2. **Extract** instruction blocks to separate files
+3. **Expand** pattern inputs via directory scanning
+4. **Resolve** precedence when multiple recipes produce same output
+5. **Build** Ninja DAG: each recipe becomes a Ninja build edge
+6. **Persist** DAG state using Ninja's on-disk format
+7. **Execute** via Ninja's parallel execution engine
+
+The `.luna` files are the source of truth. Ninja handles execution, parallelism, and rebuild detection.
+
+## File Structure
+
+```
+project/
+├── build.luna              # main build file
+├── src/
+│   ├── main.c
+│   └── util.c
+├── .luna/                  # generated (gitignore)
+│   ├── build.lua           # pre-parsed main file
+│   ├── blocks/             # extracted instruction blocks
+│   │   ├── compile_c.lua
+│   │   └── link_app.lua
+│   ├── src_main_c.luna     # generated dependency recipes
+│   └── src_util_c.luna
+└── .ninja_log              # Ninja build state (gitignore)
+```
+
+## Pre-Parse Transformation
+
+Luna pre-parses `.luna` files by extracting instruction blocks to separate files. No string escaping or complex parsing - just block extraction.
+
+**Input:** `build.luna`
+```lua
+CC = "gcc"
+
+compile_c =
+@@
+run(CC, "-c", inputs[1], "-o", outputs[1])
+@@
+
+recipes:add {
+    inputs = "app.c",
+    outputs = "app.o",
+    uses = { CC },
+    run = compile_c
+}
+```
+
+**Output:** `.luna/build.lua` (main file with blocks replaced)
+```lua
+CC = "gcc"
+
+compile_c = __instruction_block(".luna/blocks/compile_c.lua")
+
+recipes:add {
+    inputs = "app.c",
+    outputs = "app.o",
+    uses = { CC },
+    run = compile_c
+}
+```
+
+**Output:** `.luna/blocks/compile_c.lua` (instruction block, verbatim)
+```lua
+run(CC, "-c", inputs[1], "-o", outputs[1])
+```
+
+When the recipe executes, Luna loads the block file in a constrained Lua environment containing only:
+- Variables from `uses` (e.g., `CC`)
+- `inputs` table (resolved file paths)
+- `outputs` table
+- Built-in functions (`run`, `sh`, etc.)
+
+## Processing Phases
+
+1. **Pre-parse**: Extract instruction blocks from `.luna` files
+2. **Load**: Recursively load all `.luna` files (including previously-generated ones)
+3. **Execute outer Lua**: Collect recipes via `recipes:add` (not instruction blocks)
+4. **Expand patterns**: Scan directories for glob inputs
+5. **Resolve precedence**: Choose recipes when multiple produce same output
+6. **Build DAG**: Translate to Ninja format
+7. **Execute**: Ninja runs recipes in dependency order
+
+## Built-in Functions
+
+**In outer Lua scope:**
+
+| Function | Description |
+|----------|-------------|
+| `recipes:add(recipe)` | Add a recipe; returns a reference for use as input |
+| `glob(pattern)` | Returns files matching pattern |
+| `default(alias)` | Set default build target |
+| `exists(path)` | Check if file exists |
+
+**In instruction blocks:**
+
+| Function | Description |
+|----------|-------------|
+| `run(...)` | Execute shell command from arguments |
+| `sh(cmd)` | Execute shell command string |
+| `read_lines(file)` | Read file as line array |
+| `parse_depfile(file)` | Parse gcc-style .d file |
+| `write_recipe(path, recipe)` | Generate a .luna file |
+
+## Usage
+
+```sh
+luna              # Build default target
+luna <target>     # Build specific target
+luna -j N         # Run N jobs in parallel (like ninja)
+luna -c           # Clean (removes outputs and .luna/)
+luna -n           # Dry run
+luna -v           # Verbose
+```
+
+## Includes
+
+Use Lua's standard `require()` to split build logic across files:
+
+```lua
+-- build.luna
+require("rules/cpp")
+require("rules/proto")
+
+recipes:add {
+    alias = "app",
+    inputs = { compile("main.cpp"), proto("schema.proto") },
+    outputs = "app",
+    run = CC .. " -o app main.o schema.pb.o"
+}
+```
+
+```lua
+-- rules/cpp.lua
+function compile(src)
+    -- adds recipe and returns output path for use as input
+end
+```
+
+## Design Philosophy
+
+Luna has three key insights:
+
+1. **Instruction blocks are isolated**: They execute in a constrained Lua VM with only declared dependencies. This enables static DAG analysis.
+
+2. **Recipes can output recipes**: A `.luna` file is just another output. This enables single-pass compilation with correct dependency tracking.
+
+3. **Pattern inputs are first-class**: Directory scanning happens at DAG resolution. This handles header dependencies naturally without special cases.
+
+These ideas, combined with Ninja's execution engine, create a simple yet powerful build system.
+
+## Comparison to Make
+
+Luna aims to be a modern replacement for GNU Make. Here's a side-by-side comparison:
+
+**Makefile:**
+```make
+CC = gcc
+CFLAGS = -O2
+
+app.o: app.c
+	$(CC) $(CFLAGS) -c app.c -o app.o
+
+app: app.o util.o
+	$(CC) -o app app.o util.o
+
+clean:
+	rm -f *.o app
+```
+
+**build.luna:**
+```lua
+CC = "gcc"
+CFLAGS = "-O2"
+
+recipes:add {
+    inputs = "app.c",
+    outputs = "app.o",
+    run = CC .. " " .. CFLAGS .. " -c app.c -o app.o"
+}
+
+recipes:add {
+    inputs = { "app.o", "util.o" },
+    outputs = "app",
+    run = CC .. " -o app app.o util.o"
+}
+
+recipes:add {
+    alias = "clean",
+    run = "rm -f *.o app"
+}
+```
+
+The syntax is comparable in length. The key differences:
+
+|              | Make              | Luna                |
+|--------------|-------------------|---------------------|
+| Variables    | `$(VAR)`          | Lua strings: `VAR`  |
+| String ops   | Limited           | Full Lua            |
+| Conditionals | Awkward           | Lua `if/else`       |
+| Loops        | `$(foreach ...)`  | Lua `for` loops     |
+| Functions    | Macros            | Lua functions       |
+| Parallelism  | `make -j`         | Parallel by default |
+| Dependencies | Implicit possible | Explicit (in `uses`)|
+
+## Comparison to Other Build Systems
+
+Build systems exist on a spectrum from simple to complex:
+
+```
+Simple                                              Complex
+  |                                                    |
+Make ---- Luna ---- Meson ---- CMake ---- Bazel/Buck
+```
+
+**Luna's position**: A modern Make replacement. Simple enough for small projects, powerful enough for complex builds, but not trying to be a monorepo-scale build system.
+
+### vs. GNU Make
+
+Make is showing its age:
+- Tab-sensitivity causes frustrating errors
+- Variable expansion is confusing (`=` vs `:=` vs `?=`)
+- No real data structures (everything is strings)
+- Pattern rules are limited
+- Header dependency tracking requires hacks (`.d` files, `-include`)
+
+Luna keeps Make's simplicity while fixing these issues:
+- Standard Lua syntax (no tab sensitivity)
+- Real variables, tables, and functions
+- Pattern inputs are first-class
+- Header deps via recipe-as-output (no special cases)
+
+### vs. Ninja
+
+Ninja is deliberately low-level - it's a build *executor*, not a build *system*. You're expected to generate Ninja files from a higher-level tool (CMake, Meson, gn).
+
+Luna uses Ninja's execution engine internally but provides a human-writable syntax. You write `.luna` files directly, not a generator.
+
+### vs. CMake / Meson
+
+CMake and Meson are *meta-build systems* - they generate Ninja or Make files. They're designed for cross-platform builds with complex feature detection.
+
+Luna is a direct build system. If you need to detect compiler features, find libraries, or support 15 platforms - use CMake or Meson. If you just want to compile code with explicit rules, Luna is simpler.
+
+### vs. Bazel / Buck / Please
+
+These are hermetic, reproducible build systems for large monorepos. They enforce sandboxing, content-addressable caching, and remote execution.
+
+Luna is not trying to compete here. If you have a monorepo with millions of lines of code, use Bazel. If you have a normal project, Luna is much simpler.
+
+### vs. redo
+
+redo (djb-style) is philosophically similar to Luna:
+- Simple and explicit
+- Recipes are just scripts
+- Correct incremental builds
+
+Luna adds:
+- Instruction block isolation (enables static DAG analysis)
+- Recipe-as-output (elegant header dependency tracking)
+- Lua instead of shell (better for complex logic)
+
+### When to use Luna
+
+Luna is a good fit when:
+- You want something simpler than CMake but more powerful than Make
+- You're building a single-platform project (or handling cross-platform yourself)
+- You want Lua's expressiveness for build logic
+- You care about correct incremental builds
+- You want a single, static binary with no dependencies
+
+Luna is *not* a good fit when:
+- You need cross-platform feature detection (use Meson or CMake)
+- You're building a large monorepo (use Bazel)
+- You need distributed caching and remote execution
+- You're already happy with Make
+
+|                  | Luna         | Make    | Ninja  | CMake        | Bazel        |
+|------------------|--------------|---------|--------|--------------|--------------|
+| Recipe as output | **Yes**      | No      | No     | No           | No           |
+| Recipe as input  | **Yes**      | No      | No     | No           | No           |
+| Explicit deps    | **Enforced** | No      | Yes    | Yes          | **Enforced** |
+| Pattern inputs   | Yes          | Limited | No     | Yes          | Yes          |
+| Dynamic rules    | Yes          | Limited | No     | Yes          | Yes          |
+| Human-writable   | Yes          | Yes     | No     | Yes          | Yes          |
+| Parallel default | Yes          | No      | Yes    | Generator    | Yes          |
+| Cross-platform   | Manual       | Manual  | Manual | **Built-in** | **Built-in** |
+| Hermetic builds  | No           | No      | No     | No           | **Yes**      |
+| Complexity       | Low          | Low     | Low    | High         | High         |
+
+## Building Luna
+
+Luna uses graft for dependencies and GNU Make:
+
+```sh
+make
+```
+
+Produces `bin/luna` containing:
+- Modified Ninja execution engine
+- Lua 5.4 interpreter
+- Luna pre-parser and runtime
+
+## License
+
+MIT
