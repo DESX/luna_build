@@ -33,53 +33,54 @@ int luna_emit(lua_State* L) {
 
 // Lua-side API. Translating tables -> ninja syntax in Lua keeps the C side to a
 // single function and makes the surface easy to read and extend.
-const char* kPrelude =
-    "local function list(v)\n"
-    "  if v == nil then return '' end\n"
-    "  if type(v) == 'table' then return table.concat(v, ' ') end\n"
-    "  return tostring(v)\n"
-    "end\n"
-    "function variable(name, val) _luna_emit(name..' = '..tostring(val)..'\\n') end\n"
-    "var = variable\n"
-    "local rule_order = {'command','description','depfile','deps',\n"
-    "  'msvc_deps_prefix','generator','restat','rspfile','rspfile_content','pool'}\n"
-    "function rule(name, opts)\n"
-    "  _luna_emit('rule '..name..'\\n')\n"
-    "  opts = opts or {}\n"
-    "  local seen = {}\n"
-    "  for _, k in ipairs(rule_order) do\n"
-    "    if opts[k] ~= nil then _luna_emit('  '..k..' = '..tostring(opts[k])..'\\n'); seen[k] = true end\n"
-    "  end\n"
-    "  for k, v in pairs(opts) do\n"
-    "    if not seen[k] then _luna_emit('  '..k..' = '..tostring(v)..'\\n') end\n"
-    "  end\n"
-    "end\n"
-    "function build(a, b, c)\n"
-    "  local t = a\n"
-    "  if type(a) ~= 'table' or a.outputs == nil and a.rule == nil and a.inputs == nil then\n"
-    "    t = { outputs = a, rule = b, inputs = c }\n"
-    "  end\n"
-    "  local line = 'build '..list(t.outputs)\n"
-    "  if t.implicit_outputs then line = line..' | '..list(t.implicit_outputs) end\n"
-    "  line = line..': '..(t.rule or 'phony')\n"
-    "  if t.inputs then line = line..' '..list(t.inputs) end\n"
-    "  if t.implicit then line = line..' | '..list(t.implicit) end\n"
-    "  if t.order_only then line = line..' || '..list(t.order_only) end\n"
-    "  if t.validations then line = line..' |@ '..list(t.validations) end\n"
-    "  _luna_emit(line..'\\n')\n"
-    "  if t.vars then\n"
-    "    for k, v in pairs(t.vars) do _luna_emit('  '..k..' = '..tostring(v)..'\\n') end\n"
-    "  end\n"
-    "end\n"
-    "function default(...)\n"
-    "  local t = {...}\n"
-    "  if #t == 1 and type(t[1]) == 'table' then t = t[1] end\n"
-    "  _luna_emit('default '..table.concat(t, ' ')..'\\n')\n"
-    "end\n"
-    "function pool(name, opts)\n"
-    "  _luna_emit('pool '..name..'\\n')\n"
-    "  if opts and opts.depth then _luna_emit('  depth = '..tostring(opts.depth)..'\\n') end\n"
-    "end\n";
+const char* kPrelude = R"LUA(
+local function list(v)
+  if v == nil then return '' end
+  if type(v) == 'table' then return table.concat(v, ' ') end
+  return tostring(v)
+end
+function variable(name, val) _luna_emit(name..' = '..tostring(val)..'\n') end
+var = variable
+local rule_order = {'command','description','depfile','deps',
+  'msvc_deps_prefix','generator','restat','rspfile','rspfile_content','pool'}
+function rule(name, opts)
+  _luna_emit('rule '..name..'\n')
+  opts = opts or {}
+  local seen = {}
+  for _, k in ipairs(rule_order) do
+    if opts[k] ~= nil then _luna_emit('  '..k..' = '..tostring(opts[k])..'\n'); seen[k] = true end
+  end
+  for k, v in pairs(opts) do
+    if not seen[k] then _luna_emit('  '..k..' = '..tostring(v)..'\n') end
+  end
+end
+function build(a, b, c)
+  local t = a
+  if type(a) ~= 'table' or a.outputs == nil and a.rule == nil and a.inputs == nil then
+    t = { outputs = a, rule = b, inputs = c }
+  end
+  local line = 'build '..list(t.outputs)
+  if t.implicit_outputs then line = line..' | '..list(t.implicit_outputs) end
+  line = line..': '..(t.rule or 'phony')
+  if t.inputs then line = line..' '..list(t.inputs) end
+  if t.implicit then line = line..' | '..list(t.implicit) end
+  if t.order_only then line = line..' || '..list(t.order_only) end
+  if t.validations then line = line..' |@ '..list(t.validations) end
+  _luna_emit(line..'\n')
+  if t.vars then
+    for k, v in pairs(t.vars) do _luna_emit('  '..k..' = '..tostring(v)..'\n') end
+  end
+end
+function default(...)
+  local t = {...}
+  if #t == 1 and type(t[1]) == 'table' then t = t[1] end
+  _luna_emit('default '..table.concat(t, ' ')..'\n')
+end
+function pool(name, opts)
+  _luna_emit('pool '..name..'\n')
+  if opts and opts.depth then _luna_emit('  depth = '..tostring(opts.depth)..'\n') end
+end
+)LUA";
 
 bool ReadFile(const std::string& path, std::string* out, std::string* err) {
   FILE* f = fopen(path.c_str(), "rb");
