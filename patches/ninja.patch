@@ -1,0 +1,38 @@
+diff -ruN ./old/src/ninja.cc ./new/src/ninja.cc
+--- ./old/src/ninja.cc	2026-06-17 16:28:14.372832761 +0000
++++ ./new/src/ninja.cc	2026-06-17 16:28:25.016982192 +0000
+@@ -45,6 +45,7 @@
+ #include "graphviz.h"
+ #include "json.h"
+ #include "manifest_parser.h"
++#include "luna.h"
+ #include "metrics.h"
+ #include "missing_deps.h"
+ #include "state.h"
+@@ -225,7 +226,7 @@
+ "  --quiet        don't show progress status, just command output\n"
+ "\n"
+ "  -C DIR   change to DIR before doing anything else\n"
+-"  -f FILE  specify input build file [default=build.ninja]\n"
++"  -f FILE  specify input build file [default=build.luna]\n"
+ "\n"
+ "  -j N     run N jobs in parallel (0 means infinity) [default=%d on this system]\n"
+ "  -k N     keep going until N jobs fail (0 means infinity) [default=1]\n"
+@@ -1531,7 +1532,7 @@
+   // expensive cleanup when destructing NinjaMain.
+   BuildConfig config;
+   Options options = {};
+-  options.input_file = "build.ninja";
++  options.input_file = "build.luna";
+ 
+   setvbuf(stdout, NULL, _IOLBF, BUFSIZ);
+   const char* ninja_command = argv[0];
+@@ -1573,7 +1574,7 @@
+     }
+     ManifestParser parser(&ninja.state_, &ninja.disk_interface_, parser_opts);
+     string err;
+-    if (!parser.Load(options.input_file, &err)) {
++    if (!LunaLoad(parser, options.input_file, &err)) {
+       status->Error("%s", err.c_str());
+       exit(1);
+     }

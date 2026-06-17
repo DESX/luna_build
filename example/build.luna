@@ -1,0 +1,19 @@
+-- build.luna — the same build a build.ninja would describe, written in Lua.
+-- Run `luna_build` in this directory to compile ./hello.
+
+rule("cc", {
+  command = "cc $cflags -c $in -o $out",
+  description = "CC $out",
+})
+
+rule("link", {
+  command = "cc $in -o $out",
+  description = "LINK $out",
+})
+
+variable("cflags", "-O2 -Wall")
+
+build("hello.o", "cc", "hello.c")
+build("hello", "link", "hello.o")
+
+default("hello")

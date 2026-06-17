@@ -1,371 +1,235 @@
 # Luna
 
-Hermetic builds for C++. Dependencies that just work.
+**Hermetic builds for C++. Dependencies that just work.**
 
-## The Problem
+C++ dependency management is broken. Rust has Cargo; C++ has vcpkg/Conan/CMake
+glue that works on your machine and breaks in CI. The goal of Luna is simple:
 
-```cpp
-// What you want to write
-#include <fmt/core.h>
-#include <nlohmann/json.hpp>
-#include <httplib.h>
+```lua
+-- build.luna
+local cpp = require("luna.cpp")
 
-int main() {
-    auto config = nlohmann::json::parse(read_file("config.json"));
-    fmt::print("Starting server on port {}\n", config["port"]);
-    httplib::Server server;
-    // ...
+cpp.binary {
+  name = "myapp",
+  srcs = glob("src/**/*.cpp"),
+  deps = {"fmt", "nlohmann_json", "spdlog"},   -- fetched, hashed, built, cached
 }
 ```
 
-```
-// What you actually deal with
-- vcpkg? conan? system packages? git submodules?
-- Works on your machine, breaks in CI
-- New team member spends 2 days setting up dependencies
-- Upstream released a breaking change, your build is broken
-- "Just use CMake" — but CMake is the problem
+```sh
+luna_build        # works identically on every machine, forever
 ```
 
-C++ dependency management is broken. Rust solved this with Cargo. C++ has nothing.
+That is the destination. This document also describes exactly **what exists
+today** and how the rest gets built on top of it.
 
-## The Solution
+## The strategy: don't reinvent the engine
 
-```python
-# build.luna
-load("luna.dev/cpp.star", "cpp_binary")
-load("luna.dev/toolchains/clang.star", "clang")
+A build system is two things:
 
-clang(version = "17")
+1. **An execution engine** — turn a dependency graph into commands, run them in
+   parallel, do correct incremental rebuilds. Ninja already does this better
+   than almost anything, in a single static binary.
+2. **A frontend** — how humans *describe* the build.
 
-cpp_binary(
-    name = "myapp",
-    deps = ["fmt", "nlohmann_json", "cpp-httplib"],
-)
+Ninja nails (1) but its frontend is a static, non-programmable text format
+(`build.ninja`) that nobody writes by hand — you need a generator (CMake, Meson,
+gn) on top. Luna's bet: **keep ninja's engine, replace its frontend with a real
+programming language (Lua).** Once the build description is a program, the
+entire hermetic-dependency vision above becomes *ordinary Lua libraries* that
+emit build rules — no new engine required.
+
+```
+   Vision        cpp.binary / deps={...} / content-addressed cache   ← Lua modules (roadmap)
+   ───────────────────────────────────────────────────────────────
+   Foundation    build.luna  →  Lua  →  ninja manifest  →  ninja engine   ← BUILT
+```
+
+You cannot build `cpp.binary` on top of static `build.ninja` files. You can
+build it on top of a Lua-driven ninja. That foundation is what we've built
+first.
+
+## What exists today: the Lua-driven ninja core
+
+`luna_build` is a single, statically-linked binary that is a **drop-in
+replacement for ninja** — same flags, same engine, same incremental builds,
+same tools (`-t targets`, `-t clean`, …). The only difference: it reads
+`build.luna` (a Lua program) instead of `build.ninja`.
+
+```lua
+-- build.luna — the lowest layer, equivalent to hand-written ninja
+rule("cc", {
+  command = "cc $cflags -c $in -o $out",
+  description = "CC $out",
+})
+rule("link", { command = "cc $in -o $out", description = "LINK $out" })
+
+variable("cflags", "-O2 -Wall")
+
+build("hello.o", "cc", "hello.c")
+build("hello", "link", "hello.o")
+
+default("hello")
 ```
 
 ```sh
-luna build
+$ luna_build
+[1/2] CC hello.o
+[2/2] LINK hello
 ```
 
-That's it. Works identically on every machine, forever.
+Because the frontend is now a real language, even at this low level you get
+what plain ninja syntax can't express:
 
-- First build fetches dependencies (cached by content hash)
-- Subsequent builds use cache
-- Same binary on Linux, macOS, Windows
-- New team member clones repo, runs `luna build`, done
-
-## How It Works
-
-### Content-Addressed Everything
-
-Every module, every dependency, every toolchain is identified by its SHA256 hash:
-
-```python
-load(
-    "luna.dev/cpp.star",
-    "cpp_binary",
-    sha256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
-)
+```lua
+-- one rule, many targets
+local objs = {}
+for _, name in ipairs({"parser", "lexer", "eval", "main"}) do
+  build(name .. ".o", "cc", "src/" .. name .. ".c")
+  objs[#objs + 1] = name .. ".o"
+end
+build("app", "link", objs)
+default("app")
 ```
 
-The URL is how you discover it. The hash is what it is. Once cached, the URL is irrelevant.
+## How the core is built (minimal patch + overlay)
 
-**Implications:**
-- Original repo could be deleted—doesn't matter, you have the hash
-- No MITM attacks—content is verified
-- Builds are reproducible forever
-- Your cache IS your copy—no need to fork/mirror dependencies
+Luna Build is **not a fork of ninja**. It is upstream ninja plus Lua, assembled
+with [graft](../graft) using the smallest possible set of changes:
 
-### Standard Library (No Manual Hashes)
-
-For common dependencies, Luna ships a signed manifest. You write:
-
-```python
-deps = ["fmt", "nlohmann_json", "boost_asio"]
+```
+            ┌──────────────┐   patch: src/ninja.cc (4 hunks)
+   ninja ───┤   graft       ├── overlay: src/luna.{cc,h}  ──┐
+            │   FETCH       │                                │   static link
+   lua ─────┤               ├── make liblua.a ──────────────┼──► luna_build
+            └──────────────┘                                │
 ```
 
-Luna looks up the hashes internally. The manifest is signed and versioned with Luna releases. You trust Luna, not individual URLs.
+The key trick keeps the new code small: instead of reimplementing ninja's graph
+builder against a Lua API, the `.luna` file's `rule`/`build`/… calls **emit
+ordinary ninja manifest text**, which is handed straight to ninja's own
+`ManifestParser`. All of ninja's parsing, evaluation, dependency graph, and
+scheduling logic is reused unchanged.
 
-For custom dependencies, you provide the hash explicitly or let Luna generate a lockfile.
+| Piece | What it is | Size |
+|-------|------------|------|
+| `patches/ninja.patch` | the *only* edit to ninja's code — default file → `build.luna`, route loading through `LunaLoad()` | 4 hunks, 1 file |
+| `overlays/ninja/src/luna.cc` | Lua interpreter + a Lua prelude mapping the API to ninja text | ~130 lines |
+| `overlays/ninja/src/luna.h` | one-function header | ~25 lines |
+| `Makefile` | graft wiring + static link | ~70 lines |
 
-### Patching Without Forking
+Nothing else in ninja is touched. To bump ninja, change `NINJA_COMMIT` in the
+`Makefile`; the 4-hunk patch re-targets trivially (`make ninja_patch`
+regenerates it against a fresh checkout).
 
-Found a bug in a dependency? Don't fork the entire repo:
+## Building
 
-```python
-cpp_binary(
-    name = "myapp",
-    deps = [
-        dep("openssl", patches = ["./patches/fix-arm64.patch"]),
-        "fmt",
-    ],
-)
-```
-
-The base dependency is immutable (hash-verified). Your patch is local, version-controlled, applied at build time. When upstream fixes the bug, remove your patch.
-
-### Offline Builds
-
-For air-gapped environments:
+Requirements: GNU Make, a C/C++ toolchain, `curl`, `git`, `tar`. [graft](https://github.com/DESX/graft)
+is self-bootstrapped by the `Makefile` at a pinned release tag — no manual setup.
 
 ```sh
-# On a machine with internet
-luna cache export -o deps.tar.gz
+make            # bootstrap graft, fetch ninja + lua, patch/overlay, statically link
+./build/luna_build --version      # 1.12.1  (the ninja core version)
 
-# Transport to secure facility
-luna cache import deps.tar.gz
-luna build --offline
+make example    # build and run the bundled example project
 ```
 
-The exported cache contains everything needed to build. No network access required.
-
-### Version From Git
-
-```python
-load("luna.dev/version.star", "git_version")
-
-cpp_binary(
-    name = "myapp",
-    version = git_version(),  # "1.2.3" from tag, or "1.2.3-7-gabc1234"
-)
-```
-
-Versions derived from git tags. Tagged commits get clean versions. Development builds include commit distance and hash.
-
-## Modules Have Opinions, Luna Doesn't
-
-Luna core is minimal:
-- Execute a dependency graph correctly and in parallel
-- Fetch modules by URL, verify by hash
-- Provide primitives to Starlark (file I/O, shell, glob, git)
-
-That's it. Luna has no opinions about:
-- Project structure
-- Compilers or toolchains
-- How to build C++ (or anything else)
-- Dependency resolution strategies
-
-**All opinions come from modules.** The `cpp.star` module has opinions about C++ builds. The `clang.star` module has opinions about Clang. You choose which opinions to adopt.
-
-Don't like how `cpp.star` handles something? Change it:
+The result is `build/luna_build` — one static binary, no runtime dependencies:
 
 ```sh
-luna inspect cpp.star        # See exactly what it does
-luna fork cpp.star           # Copy to ./modules/cpp.star
-# Edit to your liking
+$ ldd build/luna_build
+        not a dynamic executable
 ```
 
-Modules are simple Starlark files, not black boxes.
+## The `.luna` API (core layer)
 
-## The Module Ecosystem
+A `build.luna` file is a Lua script. These globals each generate the
+corresponding ninja construct. Higher-level modules (see Roadmap) will be Lua
+libraries that ultimately call these.
 
-### Standard Modules (Maintained by Luna)
+### `rule(name, opts)`
 
-```
-luna.dev/
-├── cpp.star              # cpp_binary, cpp_library, cpp_test
-├── toolchains/
-│   ├── clang.star        # Hermetic Clang
-│   ├── gcc.star          # Hermetic GCC
-│   └── msvc.star         # MSVC detection
-└── version.star          # Git-based versioning
-```
-
-### Curated Libraries
-
-```
-luna.dev/libs/
-├── fmt.star              # {fmt} formatting library
-├── json.star             # nlohmann/json
-├── spdlog.star           # Fast logging
-├── catch2.star           # Testing framework
-├── boost/                # Boost libraries (individual modules)
-├── openssl.star          # OpenSSL (wraps complex build)
-└── ...                   # ~100 common libraries
+```lua
+rule("cc", {
+  command = "cc $cflags -c $in -o $out",   -- required
+  description = "CC $out",
+  depfile = "$out.d",
+  deps = "gcc",                            -- "gcc" or "msvc"
+  -- generator, restat, rspfile, rspfile_content, pool, ... all supported
+})
 ```
 
-Each library module:
-- Fetches source by hash
-- Builds hermetically
-- Works on all platforms
-- Is readable and forkable
+Any key/value becomes a `key = value` line in the rule. `$in`, `$out`, and
+custom `$vars` work exactly as in ninja.
 
-### Community Modules
+### `build(...)`
 
-Anyone can publish a module:
+Simple positional, or the full table form for the rest of ninja's edge syntax:
 
-1. Write a `.star` file
-2. Host it anywhere (GitHub, your server, etc.)
-3. Share the URL
+```lua
+build("hello.o", "cc", "hello.c")          -- outputs, rule, inputs
 
-No registry. No accounts. No gatekeepers.
-
-## Example: Full Project
-
-**Repository structure:**
-
-```
-myapp/
-├── build.luna
-├── src/
-│   ├── main.cpp
-│   └── server.cpp
-├── include/
-│   └── server.hpp
-├── tests/
-│   └── test_server.cpp
-└── patches/
-    └── openssl-fix.patch
+build {
+  outputs = {"a.o", "b.o"},                -- string or list
+  rule = "cc",
+  inputs = {"a.c", "b.c"},
+  implicit = "config.h",                   -- | implicit deps
+  order_only = "gen_headers",              -- || order-only deps
+  implicit_outputs = "a.log",              -- | implicit outputs
+  validations = "checkstamp",              -- |@ validations
+  vars = { cflags = "-O0" },               -- per-edge variable overrides
+}
 ```
 
-**build.luna:**
+### `variable(name, value)` (alias `var`), `default(...)`, `pool(name, opts)`
 
-```python
-load("luna.dev/cpp.star", "cpp_binary", "cpp_test")
-load("luna.dev/toolchains/clang.star", "clang")
-load("luna.dev/version.star", "git_version")
-
-clang(version = "17")
-
-cpp_binary(
-    name = "myapp",
-    version = git_version(),
-    srcs = glob("src/**/*.cpp"),
-    hdrs = glob("include/**/*.hpp"),
-    deps = [
-        "fmt",
-        "nlohmann_json",
-        "spdlog",
-        dep("openssl", patches = ["patches/openssl-fix.patch"]),
-    ],
-)
-
-cpp_test(
-    name = "tests",
-    srcs = glob("tests/**/*.cpp"),
-    deps = [":myapp", "catch2"],
-)
+```lua
+variable("cflags", "-O2 -Wall")            -- top-level ninja binding
+default("hello")                           -- or default("a", "b") / default({...})
+pool("link_pool", { depth = 4 })
 ```
 
-**Commands:**
+Plus everything Lua gives you: variables, functions, loops, `require`, string
+handling, and the standard library.
 
-```sh
-luna build          # Build myapp
-luna test           # Run tests
-luna build --release # Optimized build
-luna clean          # Remove build artifacts
-luna cache status   # Show cached dependencies
-```
+## Roadmap: from core to vision
 
-## Architecture
+Each layer is a Lua library that emits the rules/builds of the layer below.
+None of it requires touching the engine again.
 
-### Luna Core (Go)
-
-```
-luna
-├── Starlark interpreter (starlark-go)
-├── Module fetcher (URL + SHA256 verification)
-├── Content-addressed cache
-├── DAG builder
-├── Parallel executor
-└── CLI
-```
-
-### Primitives Exposed to Starlark
-
-```python
-# File operations
-read(path)
-write(path, content)
-glob(pattern)
-
-# Execution
-sh(command)
-env(name)
-
-# Network (cached)
-fetch(url, sha256)
-
-# Git
-git.describe()
-git.tags()
-git.sha()
-
-# Recipes
-recipes.add(
-    alias = "build",
-    inputs = [...],
-    outputs = [...],
-    run = "...",
-)
-```
-
-### Extensibility
-
-Luna's primitives are low-level enough that you could theoretically implement:
-- A full Cargo-compatible resolver for Rust
-- A Go modules implementation
-- A Python package manager
-
-This is out of scope for v1.0, but the architecture doesn't prevent it.
-
-## Why Luna?
-
-### vs. CMake + vcpkg/conan
-
-| | Luna | CMake + vcpkg |
-|---|------|---------------|
-| Setup time | `curl \| sh` | Install CMake, vcpkg, configure toolchain file, etc. |
-| New machine | `luna build` works | Hours of environment setup |
-| Hermetic | Yes | No (system deps leak in) |
-| Reproducible | Hash-verified | Best effort |
-| Readable | 10-line build.luna | Hundreds of lines of CMake |
-
-### vs. Bazel
-
-| | Luna | Bazel |
-|---|------|-------|
-| Binary | Single static binary | JVM + multiple components |
-| Learning curve | Familiar Python-like syntax | Steep |
-| Setup | Download and run | Complex workspace setup |
-| Focus | Get things done | Google-scale correctness |
-
-### vs. Just Using Cargo/Go
-
-Cargo and Go have great tooling. If you're writing pure Rust or pure Go, use them.
-
-Luna is for:
-- C++ projects (no good solution exists)
-- Polyglot projects (C++ core, Python bindings, etc.)
-- Projects that need hermetic builds without Bazel's complexity
-
-## Installation
-
-```sh
-# Linux/macOS
-curl -fsSL https://luna.dev/install.sh | sh
-
-# Windows
-irm https://luna.dev/install.ps1 | iex
-
-# Or download directly
-wget https://github.com/example/luna/releases/latest/download/luna-$(uname -s)-$(uname -m)
-chmod +x luna-*
-mv luna-* /usr/local/bin/luna
-```
-
-Single binary. No dependencies. No runtime.
+- ⬜ **`luna.cpp` module** — `cpp.binary` / `cpp.library` / `cpp.test`: expand a
+  high-level target into `cc`/`link` rules and `build` edges.
+- ⬜ **Dependency resolution** — `deps = {"fmt", ...}` resolved against a signed
+  manifest of known libraries; custom deps by URL + SHA256.
+- ⬜ **Content-addressed cache** — every dependency, toolchain, and artifact keyed
+  by hash; reproducible, MITM-proof, offline-capable.
+- ⬜ **Hermetic toolchains** — pinned Clang/GCC fetched and verified, so builds are
+  identical across machines.
+- ⬜ **Patching without forking** — local patches applied to hash-pinned deps at
+  build time (graft already models this; surface it in `.luna`).
+- ⬜ **`subninja`/`include` equivalents** — Lua `dofile`/`require` partly cover this.
 
 ## Status
 
-Luna is in early development. The current focus is:
+Working prototype of the foundation. Built on ninja `v1.12.1` + Lua `5.4.7`.
 
-1. Core runtime (Starlark + DAG execution)
-2. C++ module with hermetic Clang
-3. Initial library set (~30 common C++ libraries)
-4. Linux and macOS support (Windows to follow)
+- ✅ Static single binary; full ninja CLI and tools
+- ✅ `rule` / `build` / `variable` / `default` / `pool`
+- ✅ Implicit / order-only / validation deps, per-edge vars, `depfile`/`deps`
+- ⬜ The dependency-management layers above (Roadmap)
+
+## Layout
+
+```
+luna_build/
+├── Makefile                      # graft-driven build
+├── patches/ninja.patch           # the only edit to ninja's own code
+├── overlays/ninja/src/luna.{cc,h}# Lua frontend (new files)
+├── example/{build.luna,hello.c}  # sample build
+└── build/                        # generated: ninja/, lua/, luna_build
+```
 
 ## License
 
-MIT
+The Luna glue (Makefile, `luna.cc`, `luna.h`, patches) is MIT.
+Ninja is Apache-2.0; Lua is MIT. Each retains its own license.
